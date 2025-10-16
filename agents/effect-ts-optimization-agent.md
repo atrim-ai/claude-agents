@@ -4,7 +4,7 @@ description: Systematically analyze and optimize Effect-TS patterns, eliminate "
 author: Claude Code
 version: 1.1
 tags: [effect-ts, typescript, testing, optimization, validation]
-model: claude-3-opus-4-20250805
+model: claude-sonnet-4-5-20250929
 ---
 
 # Effect-TS Optimization Agent
@@ -136,7 +136,151 @@ Systematically analyze and optimize Effect-TS patterns across the codebase, appl
   - Proper service definitions with Context and Layer
   - Type-safe function composition using Effect pipes
 
-### 8. Effect.gen Anti-Pattern Detection and Refactoring
+### 8. error: unknown Anti-Pattern in Effect Error Handlers
+**Explicitly typing error as unknown in Effect error handlers is an anti-pattern:**
+
+#### Detection Commands
+```bash
+# Find Effect.mapError with error: unknown
+rg "Effect\.mapError\(\(error:\s*unknown\)" --type ts
+
+# Find Effect.catchAll with error: unknown
+rg "Effect\.catchAll\(\(error:\s*unknown\)" --type ts
+
+# Find legacy Effect.promise usage (often paired with mapError)
+rg "Effect\.promise\(" --type ts
+
+# Find Effect.catchTag with error: unknown
+rg "Effect\.catchTag\(\(error:\s*unknown\)" --type ts
+```
+
+#### Problematic Patterns
+
+**1. Effect.mapError with error: unknown (ANTI-PATTERN)**
+```typescript
+// BAD: Explicit unknown typing loses type information
+Effect.promise(async () => fetchData()).pipe(
+  Effect.mapError((error: unknown) => {
+    const msg = error instanceof Error ? error.message : String(error)
+    return new MyError({ message: msg })
+  })
+)
+
+// GOOD: Use Effect.tryPromise instead
+Effect.tryPromise({
+  try: async () => fetchData(),
+  catch: (error) =>  // error is unknown per spec, immediately wrap
+    new MyError({
+      message: 'Fetch failed',
+      cause: error
+    })
+})
+```
+
+**2. Effect.catchAll with error: unknown on typed errors (ANTI-PATTERN)**
+```typescript
+// BAD: Loses type information from upstream Effect
+storage.queryRaw(sql).pipe(
+  Effect.catchAll((error: unknown) => {
+    // Multiple type guards needed - type info was lost
+    const errorMessage =
+      error && typeof error === 'object' && 'message' in error
+        ? String((error as { message: unknown }).message)
+        : error instanceof Error ? error.message
+        : JSON.stringify(error)
+    return Effect.fail(new MyError({ message: errorMessage }))
+  })
+)
+
+// GOOD: Preserve upstream error type
+storage.queryRaw(sql).pipe(
+  Effect.catchAll((error) => {  // error is StorageError (inferred)
+    // Direct access to error properties - no type guards needed
+    return Effect.fail(new MyError({
+      message: `Query failed: ${error.message}`,
+      cause: error
+    }))
+  })
+)
+```
+
+**3. Legacy Effect.promise pattern (ANTI-PATTERN)**
+```typescript
+// BAD: Legacy pattern with error: unknown
+return Effect.promise(async () => {
+  const response = await fetch('/api')
+  return response.json()
+}).pipe(
+  Effect.mapError((error: unknown) => new MyError({ ... }))
+)
+
+// GOOD: Modern Effect.tryPromise
+return Effect.tryPromise({
+  try: async () => {
+    const response = await fetch('/api')
+    return response.json()
+  },
+  catch: (error) => new MyError({
+    message: 'API call failed',
+    cause: error
+  })
+})
+```
+
+#### Acceptable Use Cases
+
+**error: unknown is ONLY acceptable in these contexts:**
+
+1. **Effect.tryPromise catch handlers** (Effect-TS specification)
+   ```typescript
+   Effect.tryPromise({
+     try: () => fetch('/api'),
+     catch: (error) =>  // error is unknown per spec - ACCEPTABLE
+       new MyError({ message: 'Failed', cause: error })
+   })
+   ```
+
+2. **Error constructor cause parameters**
+   ```typescript
+   export class MyError extends Data.TaggedError<'MyError'>({
+     message: Schema.String,
+     cause?: Schema.Unknown  // Explicitly optional unknown - ACCEPTABLE
+   }) {}
+   ```
+
+3. **When immediately wrapping in typed error**
+   ```typescript
+   .pipe(
+     Effect.catchAll((error: unknown) =>  // ACCEPTABLE if immediate wrap
+       Effect.fail(new TypedError({ cause: error }))
+     )
+   )
+   ```
+
+#### Refactoring Strategy
+
+1. **Replace Effect.promise with Effect.tryPromise**:
+   - Migrate all `Effect.promise().pipe(Effect.mapError())` to `Effect.tryPromise({ try, catch })`
+   - Ensure catch handler immediately wraps in typed error
+
+2. **Remove explicit unknown typing in catchAll**:
+   - Let TypeScript infer error type from upstream Effect
+   - Only add explicit unknown if truly necessary (rare)
+
+3. **Eliminate runtime type checking**:
+   - If you need multiple type guards, you've lost type information
+   - Fix the upstream Effect to have proper error types
+   - Use typed error constructors throughout Effect chain
+
+#### Benefits of Proper Error Typing
+
+- ✅ **Compile-time safety**: TypeScript catches error handling mistakes
+- ✅ **Better IDE support**: Autocomplete for error properties
+- ✅ **Reduced runtime checks**: No need for instanceof/typeof guards
+- ✅ **Clear error contracts**: Effect<A, E, R> documents possible errors
+- ✅ **Type-safe error recovery**: Match on specific error tags
+
+### 9. Effect.gen Anti-Pattern Detection and Refactoring
 **Unnecessary Effect.gen usage is a code smell indicating over-engineering:**
 
 #### Detection Commands
@@ -277,13 +421,20 @@ Effect.gen(function* (_) {
 - **Tests without proper layer composition** (direct mocking instead of mock layers)
 - **Type assertions bypassing Effect dependencies** (`as Effect<A, E, never>`, `as unknown as Effect<...>`)
 - **Service layers declaring no dependencies but returning methods with dependencies**
+- **error: unknown in Effect error handlers** (Effect.mapError, Effect.catchAll)
+- **Legacy Effect.promise pattern** (should use Effect.tryPromise instead)
+- **Multiple type guards in error handlers** (indicates lost type information)
 
 ### Refactoring Priorities
 1. **Critical**:
    - Effect.Adaptor elimination (type safety circumvention)
    - Type assertions bypassing Effect dependencies (`as Effect<A, E, never>`)
    - Service layers with hidden dependencies causing runtime errors
-2. **High**: Type safety issues, "as any" usage, tests without proper layers
+2. **High**:
+   - Type safety issues, "as any" usage
+   - error: unknown in Effect error handlers (loses type information)
+   - Legacy Effect.promise patterns (should use Effect.tryPromise)
+   - Tests without proper layers
 3. **Medium**: Overly complex Effect patterns, helper abstractions
 4. **Low**: Style consistency, minor optimizations
 
@@ -335,12 +486,15 @@ const response = apiClient.post(url, data) as any // TypeScript comment: pending
 - ✅ Temporary `as any` usage documented with comments
 - ✅ Clear inventory of remaining type improvement areas
 
-### Phase 2: Type Safety Excellence  
+### Phase 2: Type Safety Excellence
 - ✅ Zero permanent "as any" usage across codebase
+- ✅ Zero error: unknown in Effect.mapError/catchAll (except Effect.tryPromise catch handlers)
+- ✅ All Effect.promise migrated to Effect.tryPromise
 - ✅ All tests pass with strict TypeScript checking
 - ✅ Consistent Effect-TS patterns following best practices
 - ✅ Clean, maintainable test code without helper abstractions
 - ✅ Proper type safety with explicit null handling
+- ✅ No runtime type guards in error handlers (compile-time error types instead)
 
 ### Overall Achievement Metrics
 - **Before**: X TypeScript errors, Y test failures
@@ -424,8 +578,8 @@ const result = await Effect.runPromise(
 
 ### Systematic Process:
 
-#### Opus Model Strategic Planning Phase
-**Use Opus 4.1 (claude-3-opus-4-20250805) for comprehensive analysis:**
+#### Strategic Planning Phase
+**Use Sonnet 4.5 (claude-sonnet-4-5-20250929) for comprehensive analysis:**
 1. **Read ALL failing tests and TypeScript errors** to understand the complete scope
 2. **Analyze cross-package dependencies** and service boundaries
 3. **Create comprehensive strategy** for Effect-TS optimization approach
@@ -433,18 +587,58 @@ const result = await Effect.runPromise(
 5. **Identify critical paths** and prioritize fixes by impact and complexity
 6. **Design validation approach** ensuring zero functional regression
 
+#### Specific Steps for error: unknown Refactoring:
+1. **Discovery Phase**:
+   ```bash
+   # Find all error: unknown patterns
+   rg "Effect\.mapError\(\(error:\s*unknown\)" --type ts
+   rg "Effect\.catchAll\(\(error:\s*unknown\)" --type ts
+   rg "Effect\.promise\(" --type ts
+
+   # Analyze context to determine if acceptable
+   rg "Effect\.mapError\(\(error:\s*unknown\)" --type ts -C 3
+   rg "Effect\.catchAll\(\(error:\s*unknown\)" --type ts -C 3
+   ```
+
+2. **Classification Phase**:
+   - Effect.tryPromise catch handlers → Keep (acceptable per spec)
+   - Effect.promise + mapError → Migrate to tryPromise
+   - catchAll on typed errors → Remove explicit unknown
+   - Multiple type guards present → Indicates lost type info (fix upstream)
+
+3. **Refactoring Phase**:
+   - Replace Effect.promise with Effect.tryPromise
+   - Remove explicit unknown typing in catchAll when upstream has typed errors
+   - Ensure all catch handlers immediately wrap in typed errors
+   - Eliminate runtime type guard chains
+
+4. **Validation Phase**:
+   ```bash
+   # Verify error: unknown only in acceptable contexts
+   rg "Effect\.tryPromise" --type ts -A 5 | rg "error:\s*unknown"
+
+   # Check for remaining problematic patterns
+   rg "Effect\.mapError\(\(error:\s*unknown\)" --type ts
+   rg "Effect\.catchAll\(\(error:\s*unknown\)" --type ts
+
+   # Run full validation
+   pnpm typecheck:all
+   pnpm test
+   pnpm test:integration
+   ```
+
 #### Specific Steps for Effect.gen Refactoring:
 1. **Discovery Phase**:
    ```bash
    # CRITICAL: Search for the exact underscore pattern FIRST
    rg "Effect\.gen\(function\* \(_\)" --type ts
-   
+
    # Find all occurrences with context
    rg "Effect\.gen\(function\*" --type ts -C 5 > effect-gen-audit.txt
-   
+
    # Count by package
    rg "Effect\.gen\(function\*" --type ts | cut -d: -f1 | xargs dirname | sort | uniq -c
-   
+
    # IMPORTANT: The underscore parameter pattern (_) is a strong indicator of anti-pattern
    # Effect.gen(function* (_) { ... }) should usually be simplified
    ```
@@ -477,7 +671,7 @@ const result = await Effect.runPromise(
 
 #### For Complex Scenarios (50+ TypeScript errors):
 1. **Pre-analysis validation**: Run all validation tools to establish baseline
-2. **Strategic planning with Opus**: Comprehensive analysis of all issues and approach design
+2. **Strategic planning with Sonnet**: Comprehensive analysis of all issues and approach design
 3. **Phase 1 execution** (can delegate to Sonnet after planning):
    - Add temporary `as any` fixes with documentation comments
    - Focus on achieving ALL tests passing first
